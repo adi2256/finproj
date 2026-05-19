@@ -17,18 +17,24 @@ DATABASE_URL = (
 # --- Storage backend ---
 # "local"  → plain files on disk inside ./storage/  (default, zero setup)
 # "minio"  → MinIO Docker container, S3-compatible, browser UI at :9001
+# "b2"     → Backblaze B2 (S3-compatible, requires B2 app key)
 # "s3"     → AWS S3 (requires real AWS credentials)
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
 
-# Local backend root (ignored when backend is minio/s3)
+# Local backend root (ignored when backend is minio/b2/s3)
 STORAGE_ROOT = os.getenv("STORAGE_ROOT", "storage")
 
-# MinIO settings (ignored when backend is local/s3)
+# MinIO settings (only used when STORAGE_BACKEND=minio)
 MINIO_ENDPOINT         = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
 MINIO_ROOT_USER        = os.getenv("MINIO_ROOT_USER", "minioadmin")
 MINIO_ROOT_PASSWORD    = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
 
-# Used by boto3 for both MinIO and real S3
+# Backblaze B2 settings (only used when STORAGE_BACKEND=b2)
+B2_ENDPOINT            = os.getenv("B2_ENDPOINT", "")
+B2_APPLICATION_KEY_ID  = os.getenv("B2_APPLICATION_KEY_ID", "")
+B2_APPLICATION_KEY     = os.getenv("B2_APPLICATION_KEY", "")
+
+# Used by boto3 for MinIO, B2, and AWS S3
 AWS_REGION             = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID      = os.getenv("AWS_ACCESS_KEY_ID", MINIO_ROOT_USER)
 AWS_SECRET_ACCESS_KEY  = os.getenv("AWS_SECRET_ACCESS_KEY", MINIO_ROOT_PASSWORD)

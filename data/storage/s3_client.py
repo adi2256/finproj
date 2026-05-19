@@ -28,6 +28,9 @@ from config.settings import (
     AWS_ACCESS_KEY_ID,
     AWS_REGION,
     AWS_SECRET_ACCESS_KEY,
+    B2_APPLICATION_KEY,
+    B2_APPLICATION_KEY_ID,
+    B2_ENDPOINT,
     MINIO_ENDPOINT,
     S3_BUCKET,
     S3_PREFIXES,
@@ -44,17 +47,25 @@ _s3_client = None
 
 
 def _get_s3():
-    """Return a boto3 client pointed at MinIO or real AWS depending on config."""
+    """Return a boto3 client pointed at MinIO, Backblaze B2, or real AWS depending on config."""
     global _s3_client
     if _s3_client is None:
         import boto3
-        kwargs = dict(
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        )
-        if STORAGE_BACKEND == "minio":
-            kwargs["endpoint_url"] = MINIO_ENDPOINT
+        if STORAGE_BACKEND == "b2":
+            kwargs = dict(
+                region_name=AWS_REGION,
+                aws_access_key_id=B2_APPLICATION_KEY_ID,
+                aws_secret_access_key=B2_APPLICATION_KEY,
+                endpoint_url=B2_ENDPOINT,
+            )
+        else:
+            kwargs = dict(
+                region_name=AWS_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            )
+            if STORAGE_BACKEND == "minio":
+                kwargs["endpoint_url"] = MINIO_ENDPOINT
         _s3_client = boto3.client("s3", **kwargs)
     return _s3_client
 

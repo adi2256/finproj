@@ -22,9 +22,13 @@ x-airflow-common: &airflow-common
     # Override host-machine DB settings for Docker networking
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
-    # Storage — point Airflow tasks at MinIO inside Docker network
+    # Storage — MinIO for local dev, B2 for production
     STORAGE_BACKEND: ${STORAGE_BACKEND:-minio}
     MINIO_ENDPOINT: http://minio:9000
+    # Backblaze B2 (only used when STORAGE_BACKEND=b2)
+    B2_ENDPOINT: ${B2_ENDPOINT:-}
+    B2_APPLICATION_KEY_ID: ${B2_APPLICATION_KEY_ID:-}
+    B2_APPLICATION_KEY: ${B2_APPLICATION_KEY:-}
   volumes:
     - ./dags:/opt/airflow/dags
     - ./data:/opt/airflow/data
