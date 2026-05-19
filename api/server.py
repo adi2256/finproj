@@ -161,6 +161,170 @@ def price_history():
     return jsonify(result)
 
 
+@app.route("/api/sentiment/overview")
+def sentiment_overview():
+    """Market-wide sentiment snapshot from filing sentiment + news (when available)."""
+    days = request.args.get("days", 30, type=int)
+    with get_conn() as conn:
+        # Check if we have news-based daily aggregations
+        news_count = conn.execute(text(
+            "SELECT count(*) FROM daily_sentiment_agg WHERE date >= current_date - CAST(:days AS integer)"
+        ), {"days": days}).scalar()
+
+        if news_count and news_count > 0:
+            # Use news-based aggregations when available
+            overall = conn.execute(text("""
+                SELECT round(avg(avg_score)::numeric, 4),
+                       count(DISTINCT ticker), count(*)
+                FROM daily_sentiment_agg
+                WHERE date >= current_date - CAST(:days AS integer)
+            """), {"days": days}).fetchone()
+
+            by_ticker = conn.execute(text("""
+                SELECT d.ticker, s.name, s.sector,
+                       round(avg(d.avg_score)::numeric, 4),
+                       round(avg(d.positive_pct)::numeric, 1),
+                       round(avg(d.negative_pct)::numeric, 1),
+                       sum(d.article_count)
+                FROM daily_sentiment_agg d
+                JOIN stocks s ON s.ticker = d.ticker
+                WHERE d.date >= current_date - CAST(:days AS integer)
+                GROUP BY d.ticker, s.name, s.sector
+                ORDER BY avg(d.avg_score) DESC
+            """), {"days": days}).fetchall()
+
+            sector_sent = conn.execute(text("""
+                SELECT s.sector,
+                       round(avg(d.avg_score)::numeric, 4),
+                       round(avg(d.positive_pct)::numeric, 1),
+                       round(avg(d.negative_pct)::numeric, 1),
+                       sum(d.article_count)
+                FROM daily_sentiment_agg d
+                JOIN stocks s ON s.ticker = d.ticker
+                WHERE d.date >= current_date - CAST(:days AS integer)
+                GROUP BY s.sector
+                ORDER BY avg(d.avg_score) DESC
+            """), {"days": days}).fetchall()
+        else:
+            # Fall back to filing sentiment data
+            overall = conn.execute(text("""
+                SELECT round(avg(fs.avg_score)::numeric, 4),
+                       count(DISTINCT fs.ticker),
+                       count(*)
+                FROM filing_sentiment fs
+                WHERE fs.period >= current_date - CAST(:days AS integer)
+            """), {"days": days}).fetchone()
+
+            by_ticker = conn.execute(text("""
+                SELECT fs.ticker, s.name, s.sector,
+                       round(avg(fs.avg_score)::numeric, 4),
+                       round(100.0 * sum(CASE WHEN fs.label = 'positive' THEN 1 ELSE 0 END) / count(*), 1),
+                       round(100.0 * sum(CASE WHEN fs.label = 'negative' THEN 1 ELSE 0 END) / count(*), 1),
+                       count(*)
+                FROM filing_sentiment fs
+                JOIN stocks s ON s.ticker = fs.ticker
+                WHERE fs.period >= current_date - CAST(:days AS integer)
+                GROUP BY fs.ticker, s.name, s.sector
+                ORDER BY avg(fs.avg_score) DESC
+            """), {"days": days}).fetchall()
+
+            sector_sent = conn.execute(text("""
+                SELECT s.sector,
+                       round(avg(fs.avg_score)::numeric, 4),
+                       round(100.0 * sum(CASE WHEN fs.label = 'positive' THEN 1 ELSE 0 END) / count(*), 1),
+                       round(100.0 * sum(CASE WHEN fs.label = 'negative' THEN 1 ELSE 0 END) / count(*), 1),
+                       count(*)
+                FROM filing_sentiment fs
+                JOIN stocks s ON s.ticker = fs.ticker
+                WHERE fs.period >= current_date - CAST(:days AS integer)
+                GROUP BY s.sector
+                ORDER BY avg(fs.avg_score) DESC
+            """), {"days": days}).fetchall()
+
+    tickers = [{
+        "ticker": r[0], "name": r[1], "sector": r[2],
+        "avg_score": float(r[3] or 0), "positive_pct": float(r[4] or 0),
+        "negative_pct": float(r[5] or 0), "articles": int(r[6] or 0),
+    } for r in by_ticker]
+
+    return jsonify({
+        "market_avg": float(overall[0] or 0) if overall else 0,
+        "tickers_with_data": int(overall[1] or 0) if overall else 0,
+        "total_rows": int(overall[2] or 0) if overall else 0,
+        "by_ticker": tickers,
+        "most_bullish": tickers[:5] if tickers else [],
+        "most_bearish": list(reversed(tickers[-5:])) if tickers else [],
+        "by_sector": [{
+            "sector": r[0], "avg_score": float(r[1] or 0),
+            "positive_pct": float(r[2] or 0), "negative_pct": float(r[3] or 0),
+            "articles": int(r[4] or 0),
+        } for r in sector_sent],
+    })
+
+
+@app.route("/api/sentiment/history/<ticker>")
+def sentiment_history(ticker):
+    """Daily sentiment time series for a single ticker."""
+    days = request.args.get("days", 90, type=int)
+    with get_conn() as conn:
+        rows = conn.execute(text("""
+            SELECT date, avg_score, min_score, max_score,
+                   article_count, positive_pct, negative_pct, neutral_pct
+            FROM daily_sentiment_agg
+            WHERE ticker = :ticker AND date >= current_date - CAST(:days AS integer)
+            ORDER BY date ASC
+        """), {"ticker": ticker.upper(), "days": days}).fetchall()
+    return jsonify([{
+        "date": str(r[0]), "avg_score": float(r[1] or 0),
+        "min_score": float(r[2] or 0), "max_score": float(r[3] or 0),
+        "article_count": int(r[4] or 0),
+        "positive_pct": float(r[5] or 0), "negative_pct": float(r[6] or 0),
+        "neutral_pct": float(r[7] or 0),
+    } for r in rows])
+
+
+@app.route("/api/sentiment/articles/<ticker>")
+def sentiment_articles(ticker):
+    """Recent scored articles for a ticker."""
+    limit = request.args.get("limit", 25, type=int)
+    with get_conn() as conn:
+        rows = conn.execute(text("""
+            SELECT n.headline, n.source, n.published_at,
+                   ss.score, ss.label, ss.scored_at
+            FROM sentiment_scores ss
+            JOIN news_articles n ON n.id = ss.article_id
+            WHERE ss.ticker = :ticker AND ss.article_id IS NOT NULL
+            ORDER BY n.published_at DESC
+            LIMIT :lim
+        """), {"ticker": ticker.upper(), "lim": limit}).fetchall()
+    return jsonify([{
+        "headline": r[0], "source": r[1],
+        "published_at": str(r[2]) if r[2] else None,
+        "score": float(r[3] or 0), "label": r[4],
+        "scored_at": str(r[5]) if r[5] else None,
+    } for r in rows])
+
+
+@app.route("/api/sentiment/filings/<ticker>")
+def sentiment_filings(ticker):
+    """Filing-level sentiment with YoY comparison."""
+    with get_conn() as conn:
+        rows = conn.execute(text("""
+            SELECT fs.period, f.type, fs.avg_score, fs.label,
+                   fs.prev_period_score, fs.score_delta
+            FROM filing_sentiment fs
+            JOIN filings f ON f.id = fs.filing_id
+            WHERE fs.ticker = :ticker
+            ORDER BY fs.period DESC
+        """), {"ticker": ticker.upper()}).fetchall()
+    return jsonify([{
+        "period": str(r[0]) if r[0] else None, "type": r[1],
+        "avg_score": float(r[2] or 0), "label": r[3],
+        "prev_score": float(r[4] or 0) if r[4] else None,
+        "score_delta": float(r[5] or 0) if r[5] else None,
+    } for r in rows])
+
+
 @app.route("/api/volume-leaders")
 def volume_leaders():
     with get_conn() as conn:
