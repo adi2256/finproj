@@ -8,7 +8,7 @@ import {
   LayoutDashboard, TrendingUp, FileText, BarChart3,
   Search, ArrowLeft, ArrowUpRight, ArrowDownRight,
   Database, Activity, Layers, Globe, Brain, ThumbsUp,
-  ThumbsDown, Minus, Newspaper
+  ThumbsDown, Newspaper
 } from 'lucide-react';
 import './App.css';
 
