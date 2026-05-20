@@ -12,6 +12,11 @@ app = Flask(__name__)
 CORS(app)
 
 
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/api/overview")
 def overview():
     with get_conn() as conn:

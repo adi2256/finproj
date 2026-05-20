@@ -12,3 +12,5 @@ venv/
 airflow/logs/
 airflow/plugins/
 storage/          # local file storage (raw articles, filings, models)
+finbert-finetuned/ # model weights (418 MB) — download via scripts/restore_model.py
+.claude/

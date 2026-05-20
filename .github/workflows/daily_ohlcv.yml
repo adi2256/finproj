@@ -1,0 +1,27 @@
+name: Daily OHLCV Ingest
+on:
+  schedule:
+    - cron: '30 11 * * 1-5'  # 6:30 AM ET weekdays
+  workflow_dispatch: {}
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      STORAGE_BACKEND: b2
+      B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+      B2_APPLICATION_KEY_ID: ${{ secrets.B2_APPLICATION_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-pipelines.txt
+      - run: pip install -r requirements-pipelines.txt
+      - name: Ingest OHLCV
+        run: python -c "from data.ingestion.price_data import run_incremental; print(f'Inserted {run_incremental()} rows')"

@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: finance-api
+    runtime: python
+    buildCommand: pip install -r requirements-cloud.txt
+    startCommand: gunicorn api.server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: STORAGE_BACKEND
+        value: b2
+      - key: B2_ENDPOINT
+        sync: false
+      - key: B2_APPLICATION_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
+      - key: B2_BUCKET
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11"

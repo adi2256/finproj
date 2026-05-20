@@ -1,0 +1,9 @@
+# Deps for GitHub Actions pipeline runners (ingestion + features)
+-r requirements-cloud.txt
+
+yfinance==0.2.38
+beautifulsoup4==4.12.3
+lxml==5.1.0
+pandas-ta==0.4.71b0
+tenacity==8.2.3
+tqdm>=4.67.1

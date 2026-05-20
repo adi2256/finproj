@@ -1,4 +1,5 @@
 """PostgreSQL connection and upsert helpers."""
+import os
 from contextlib import contextmanager
 
 from sqlalchemy import create_engine, text
@@ -12,16 +13,18 @@ _engine = None
 def get_engine():
     global _engine
     if _engine is None:
-        _engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        kwargs = dict(pool_pre_ping=True)
+        if "neon.tech" in DATABASE_URL or os.getenv("DB_SSL_REQUIRE"):
+            kwargs.update(pool_size=3, max_overflow=2)
+        _engine = create_engine(DATABASE_URL, **kwargs)
     return _engine
 
 
 @contextmanager
 def get_conn():
     engine = get_engine()
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         yield conn
-        conn.commit()
 
 
 def upsert_ohlcv(records: list[dict]) -> int:
