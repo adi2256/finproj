@@ -10,9 +10,12 @@ DB_NAME = os.getenv("POSTGRES_DB", "financedb")
 DB_USER = os.getenv("POSTGRES_USER", "finance_user")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD", "changeme")
 
-DATABASE_URL = (
+DATABASE_URL = os.getenv("DATABASE_URL") or (
     f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
+if "sslmode" not in DATABASE_URL and os.getenv("DB_SSL_REQUIRE"):
+    sep = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL += f"{sep}sslmode=require"
 
 # --- Storage backend ---
 # "local"  → plain files on disk inside ./storage/  (default, zero setup)
@@ -33,12 +36,19 @@ MINIO_ROOT_PASSWORD    = os.getenv("MINIO_ROOT_PASSWORD", "minioadmin")
 B2_ENDPOINT            = os.getenv("B2_ENDPOINT", "")
 B2_APPLICATION_KEY_ID  = os.getenv("B2_APPLICATION_KEY_ID", "")
 B2_APPLICATION_KEY     = os.getenv("B2_APPLICATION_KEY", "")
+B2_BUCKET              = os.getenv("B2_BUCKET", "")
 
 # Used by boto3 for MinIO, B2, and AWS S3
 AWS_REGION             = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID      = os.getenv("AWS_ACCESS_KEY_ID", MINIO_ROOT_USER)
 AWS_SECRET_ACCESS_KEY  = os.getenv("AWS_SECRET_ACCESS_KEY", MINIO_ROOT_PASSWORD)
 S3_BUCKET              = os.getenv("S3_BUCKET", "finance-data")
+
+def get_bucket():
+    """Return the active bucket name based on storage backend."""
+    if STORAGE_BACKEND == "b2" and B2_BUCKET:
+        return B2_BUCKET
+    return S3_BUCKET
 
 S3_PREFIXES = {
     "news":    "raw/news/",

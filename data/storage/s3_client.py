@@ -32,10 +32,10 @@ from config.settings import (
     B2_APPLICATION_KEY_ID,
     B2_ENDPOINT,
     MINIO_ENDPOINT,
-    S3_BUCKET,
     S3_PREFIXES,
     STORAGE_BACKEND,
     STORAGE_ROOT,
+    get_bucket,
 )
 
 logger = logging.getLogger(__name__)
@@ -148,10 +148,10 @@ def upload_model_dir(local_dir: str, model_version: str) -> str:
             local_path = _os.path.join(root, fname)
             rel_path = _os.path.relpath(local_path, local_dir)
             key = f"{s3_prefix}{rel_path}"
-            client.upload_file(local_path, S3_BUCKET, key)
-            logger.info("Uploaded %s → s3://%s/%s", rel_path, S3_BUCKET, key)
+            client.upload_file(local_path, get_bucket(), key)
+            logger.info("Uploaded %s → s3://%s/%s", rel_path, get_bucket(), key)
 
-    s3_path = f"s3://{S3_BUCKET}/{s3_prefix}"
+    s3_path = f"s3://{get_bucket()}/{s3_prefix}"
     logger.info("Model upload complete: %s", s3_path)
     return s3_path
 
@@ -169,14 +169,14 @@ def download_model_dir(model_version: str, local_dir: str) -> str:
     client = _get_s3()
 
     paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=s3_prefix):
+    for page in paginator.paginate(Bucket=get_bucket(), Prefix=s3_prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             rel_path = key[len(s3_prefix):]
             local_path = _os.path.join(local_dir, rel_path)
             _os.makedirs(_os.path.dirname(local_path), exist_ok=True)
-            client.download_file(S3_BUCKET, key, local_path)
-            logger.info("Downloaded s3://%s/%s → %s", S3_BUCKET, key, local_path)
+            client.download_file(get_bucket(), key, local_path)
+            logger.info("Downloaded s3://%s/%s → %s", get_bucket(), key, local_path)
 
     return local_dir
 
@@ -206,12 +206,12 @@ def _local_read_json(stored_path: str) -> dict:
 def _s3_put(body: bytes, prefix: str, filename: str, content_type: str) -> str:
     key = f"{prefix}{filename}"
     _get_s3().put_object(
-        Bucket=S3_BUCKET,
+        Bucket=get_bucket(),
         Key=key,
         Body=body,
         ContentType=content_type,
     )
-    path = f"s3://{S3_BUCKET}/{key}"
+    path = f"s3://{get_bucket()}/{key}"
     logger.debug("Uploaded: %s", path)
     return path
 
@@ -222,3 +222,100 @@ def _s3_read_json(stored_path: str) -> dict:
     bucket, key = parts[0], parts[1]
     obj = _get_s3().get_object(Bucket=bucket, Key=key)
     return json.loads(obj["Body"].read())
+
+
+# ---------------------------------------------------------------------------
+# Storage cleanup — delete old scored filings to reclaim cloud space
+# ---------------------------------------------------------------------------
+
+def delete_object(stored_path: str) -> bool:
+    """Delete a single object by its stored path. Returns True on success."""
+    if stored_path.startswith("local://"):
+        fp = Path(stored_path.removeprefix("local://"))
+        if fp.exists():
+            fp.unlink()
+            logger.debug("Deleted local: %s", stored_path)
+            return True
+        return False
+
+    assert stored_path.startswith("s3://"), f"Unexpected path: {stored_path}"
+    parts = stored_path[5:].split("/", 1)
+    bucket, key = parts[0], parts[1]
+    _get_s3().delete_object(Bucket=bucket, Key=key)
+    logger.debug("Deleted remote: %s", stored_path)
+    return True
+
+
+def cleanup_old_filings(
+    keep_days: int = 365,
+    include_unscored: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    """
+    Delete raw filing blobs from cloud storage to reclaim space.
+
+    By default only deletes filings that HAVE been scored (sentiment is safe
+    in PostgreSQL).  With include_unscored=True, also deletes old filings
+    that were never scored — useful when storage is tight and you accept
+    that ancient filings won't be scored retroactively.
+
+    Returns {"deleted": int, "freed_bytes": int, "skipped_unscored": int}.
+    """
+    from data.storage.db_client import get_engine
+    from sqlalchemy import text
+
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT f.id, f.s3_path, f.filed_at,
+                   fs.filing_id IS NOT NULL AS is_scored
+            FROM filings f
+            LEFT JOIN filing_sentiment fs ON fs.filing_id = f.id
+            WHERE f.s3_path IS NOT NULL
+              AND f.filed_at < NOW() - MAKE_INTERVAL(days => :keep_days)
+            ORDER BY f.filed_at
+        """), {"keep_days": keep_days}).fetchall()
+
+    deleted = 0
+    freed = 0
+    skipped = 0
+
+    for fid, s3_path, filed_at, is_scored in rows:
+        if not is_scored and not include_unscored:
+            skipped += 1
+            continue
+
+        obj_size = _get_object_size(s3_path)
+
+        if dry_run:
+            tag = "scored" if is_scored else "UNSCORED"
+            logger.info("[DRY RUN] Would delete %s (%s, filed %s, %s bytes)",
+                        s3_path, tag, filed_at, obj_size)
+        else:
+            delete_object(s3_path)
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE filings SET s3_path = NULL WHERE id = :id"
+                ), {"id": fid})
+            logger.info("Deleted %s (filed %s, freed %s bytes)",
+                        s3_path, filed_at, obj_size)
+
+        deleted += 1
+        freed += obj_size
+
+    return {"deleted": deleted, "freed_bytes": freed, "skipped_unscored": skipped}
+
+
+def _get_object_size(stored_path: str) -> int:
+    """Get size in bytes of a stored object."""
+    if stored_path.startswith("local://"):
+        fp = Path(stored_path.removeprefix("local://"))
+        return fp.stat().st_size if fp.exists() else 0
+
+    parts = stored_path[5:].split("/", 1)
+    bucket, key = parts[0], parts[1]
+    try:
+        resp = _get_s3().head_object(Bucket=bucket, Key=key)
+        return resp["ContentLength"]
+    except Exception:
+        return 0

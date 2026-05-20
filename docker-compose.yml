@@ -12,7 +12,7 @@ version: "3.9"
 # ============================================================
 
 x-airflow-common: &airflow-common
-  image: apache/airflow:2.8.4-python3.11
+  image: apache/airflow:2.9.3-python3.12
   env_file: .env
   environment:
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
@@ -36,7 +36,7 @@ x-airflow-common: &airflow-common
     - ./features:/opt/airflow/features
     - ./sentiment:/opt/airflow/sentiment
     - ./storage:/opt/airflow/storage      # shared local storage (used when STORAGE_BACKEND=local)
-    - ./requirements.txt:/requirements.txt
+    - ./requirements-airflow.txt:/requirements.txt
     - airflow_logs:/opt/airflow/logs
   depends_on:
     postgres:

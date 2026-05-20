@@ -30,14 +30,30 @@ with DAG(
 ) as dag:
 
     def ingest_filings(**context):
-        import sys
-        import os
+        import sys, os
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
         from data.ingestion.sec_filings import run
         stored = run()
         print(f"Stored {stored} SEC filings")
 
-    PythonOperator(
+    def cleanup_old(**context):
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from data.storage.s3_client import cleanup_old_filings
+        result = cleanup_old_filings(
+            keep_days=365, include_unscored=True, dry_run=False,
+        )
+        freed_mb = result["freed_bytes"] / 1024 ** 2
+        print(f"Deleted {result['deleted']} old filings ({freed_mb:.1f} MB freed)")
+
+    fetch = PythonOperator(
         task_id="fetch_sec_filings",
         python_callable=ingest_filings,
     )
+
+    prune = PythonOperator(
+        task_id="cleanup_old_filings",
+        python_callable=cleanup_old,
+    )
+
+    fetch >> prune

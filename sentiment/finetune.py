@@ -13,8 +13,29 @@ The script:
 """
 import argparse
 import logging
+import os
 
 import numpy as np
+import torch
+
+
+def _apply_background_mode(max_threads: int) -> None:
+    """
+    Throttle PyTorch CPU usage so the laptop stays usable during training.
+
+    - Caps the number of intra-op + inter-op threads PyTorch spawns
+    - Sets env vars that MKL/OpenBLAS/OpenMP respect before any BLAS call
+    - On macOS, the caller should also prefix the command with:
+        taskpolicy -b   (background QoS — preempted by any foreground work)
+      or:
+        nice -n 15      (UNIX niceness — lower scheduling priority)
+    """
+    torch.set_num_threads(max_threads)
+    torch.set_num_interop_threads(max(1, max_threads // 2))
+    os.environ.setdefault("OMP_NUM_THREADS",   str(max_threads))
+    os.environ.setdefault("MKL_NUM_THREADS",   str(max_threads))
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", str(max_threads))
+    logger.info("Background mode: capped to %d PyTorch threads", max_threads)
 from datasets import load_dataset
 from sklearn.metrics import f1_score, accuracy_score, classification_report
 from transformers import (
@@ -65,6 +86,27 @@ def compute_metrics(eval_pred):
     }
 
 
+def _safe_batch_size(requested: int) -> int:
+    """
+    Return a memory-safe batch size for the current device.
+    MPS (Apple Silicon) is capped at 8 to prevent Metal OOM errors.
+    """
+    if (
+        not torch.cuda.is_available()
+        and torch.backends.mps.is_available()
+        and os.getenv("SENTIMENT_USE_MPS", "0") == "1"
+    ):
+        safe = min(requested, 8)
+        if safe < requested:
+            logger.warning(
+                "MPS device detected — capping batch size %d → %d to avoid Metal OOM",
+                requested,
+                safe,
+            )
+        return safe
+    return requested
+
+
 def finetune(
     base_model: str = SENTIMENT_MODEL_NAME,
     output_dir: str = "./finbert-finetuned",
@@ -73,7 +115,23 @@ def finetune(
     learning_rate: float = 2e-5,
     warmup_ratio: float = 0.1,
     upload_s3: bool = False,
+    background: bool = False,
+    max_threads: int = 4,
 ):
+    import os as _os
+    if background:
+        _apply_background_mode(max_threads)
+
+    safe_batch = _safe_batch_size(batch_size)
+    # gradient_accumulation compensates when batch is capped, keeping effective
+    # batch size close to what was requested (e.g. cap 16→8 means accum=2)
+    grad_accum = max(1, batch_size // safe_batch)
+
+    logger.info(
+        "Training config — batch_size: %d, grad_accum: %d (effective: %d)",
+        safe_batch, grad_accum, safe_batch * grad_accum,
+    )
+
     logger.info("Loading tokenizer and model from %s", base_model)
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -90,11 +148,16 @@ def finetune(
     train_ds = tokenize_dataset(train_ds, tokenizer)
     eval_ds = tokenize_dataset(eval_ds, tokenizer)
 
+    # use_mps_device=False keeps the Trainer on CPU even if MPS is available,
+    # preventing Metal command buffer OOM on M-series chips.
+    use_mps = _os.getenv("SENTIMENT_USE_MPS", "0") == "1"
+
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size * 2,
+        per_device_train_batch_size=safe_batch,
+        per_device_eval_batch_size=safe_batch * 2,
+        gradient_accumulation_steps=grad_accum,
         learning_rate=learning_rate,
         warmup_ratio=warmup_ratio,
         weight_decay=0.01,
@@ -106,6 +169,10 @@ def finetune(
         logging_steps=50,
         save_total_limit=2,
         fp16=False,
+        bf16=False,
+        use_mps_device=use_mps,          # False by default — avoids Metal OOM
+        gradient_checkpointing=background, # trades speed for memory when throttling
+        dataloader_num_workers=0,          # no worker processes; keeps RAM usage flat
         report_to="none",
         seed=42,
     )
@@ -115,7 +182,7 @@ def finetune(
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         compute_metrics=compute_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
@@ -157,6 +224,14 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--output-dir", default="./finbert-finetuned")
     parser.add_argument("--upload-s3", action="store_true")
+    parser.add_argument(
+        "--background", action="store_true",
+        help="Throttle CPU/memory usage so the laptop stays responsive",
+    )
+    parser.add_argument(
+        "--max-threads", type=int, default=4,
+        help="Max PyTorch CPU threads in background mode (default: 4)",
+    )
     args = parser.parse_args()
 
     results = finetune(
@@ -165,5 +240,7 @@ if __name__ == "__main__":
         learning_rate=args.lr,
         output_dir=args.output_dir,
         upload_s3=args.upload_s3,
+        background=args.background,
+        max_threads=args.max_threads,
     )
     print(f"\nFinal weighted F1: {results['eval_weighted_f1']:.4f}")

@@ -1,0 +1,15 @@
+# Extra packages for Airflow workers (on top of the base Airflow image).
+# Do NOT pin packages already bundled with Airflow (sqlalchemy, requests, etc.).
+
+# Data ingestion
+yfinance==0.2.38
+
+# Feature engineering
+pandas-ta==0.4.71b0
+
+# NLP / Sentiment
+transformers>=4.40.0
+torch>=2.2.1
+
+# Utilities
+python-dotenv==1.0.1

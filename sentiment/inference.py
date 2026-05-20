@@ -18,6 +18,22 @@ from config.settings import (
     SENTIMENT_MAX_LENGTH,
     SENTIMENT_MODEL_VERSION,
 )
+
+
+def _get_device() -> torch.device:
+    """
+    Pick the best available device.
+    MPS (Apple Silicon) is used only if explicitly enabled via env var
+    SENTIMENT_USE_MPS=1 — otherwise we default to CPU to avoid Metal OOM
+    errors on M-series chips when batch sizes are large.
+    CUDA is always preferred if available.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    use_mps = os.getenv("SENTIMENT_USE_MPS", "0") == "1"
+    if use_mps and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 from data.storage.db_client import (
     bulk_insert_sentiment_scores,
     load_unscored_articles,
@@ -41,22 +57,37 @@ def _load_model(model_path: str | None = None):
     if _model is not None:
         return _model, _tokenizer
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _get_device()
+    logger.info("Using device: %s", device)
 
-    if model_path and os.path.isdir(model_path):
-        logger.info("Loading model from local path: %s", model_path)
+    def _has_model_files(path: str) -> bool:
+        return os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json"))
+
+    # 1. Explicit path passed by caller
+    if model_path and _has_model_files(model_path):
+        logger.info("Loading model from explicit path: %s", model_path)
         load_from = model_path
+
+    # 2. Local project directory (from scripts/restore_model.py)
+    elif _has_model_files(os.path.join(os.path.dirname(os.path.dirname(__file__)), "finbert-finetuned", "final")):
+        load_from = os.path.join(os.path.dirname(os.path.dirname(__file__)), "finbert-finetuned", "final")
+        logger.info("Loading model from project dir: %s", load_from)
+
+    # 3. Try S3 / MinIO
     else:
+        load_from = "ProsusAI/finbert"
         try:
             from data.storage.s3_client import download_model_dir
             local_dir = os.path.join(tempfile.gettempdir(), f"finbert-{SENTIMENT_MODEL_VERSION}")
-            if not os.path.isdir(local_dir):
+            if not _has_model_files(local_dir):
                 download_model_dir(SENTIMENT_MODEL_VERSION, local_dir)
-            load_from = local_dir
-            logger.info("Loaded model from S3: %s", SENTIMENT_MODEL_VERSION)
+            if _has_model_files(local_dir):
+                load_from = local_dir
+                logger.info("Loaded model from S3: %s", SENTIMENT_MODEL_VERSION)
+            else:
+                logger.warning("S3 download produced no model files, falling back to ProsusAI/finbert")
         except Exception as exc:
-            logger.warning("Could not load fine-tuned model from S3 (%s), falling back to ProsusAI/finbert", exc)
-            load_from = "ProsusAI/finbert"
+            logger.warning("Could not load from S3 (%s), falling back to ProsusAI/finbert", exc)
 
     _tokenizer = AutoTokenizer.from_pretrained(load_from)
     _model = AutoModelForSequenceClassification.from_pretrained(load_from)
@@ -66,13 +97,22 @@ def _load_model(model_path: str | None = None):
 
 
 def predict_batch(texts: list[str], model_path: str | None = None) -> list[dict]:
-    """Run sentiment on a list of texts. Returns list of {label, score}."""
+    """
+    Run sentiment on a list of texts. Returns list of {label, score}.
+
+    On Apple Silicon (MPS) the Metal command buffer can exhaust GPU memory
+    with large batches. We cap at 8 per batch when on MPS and flush the
+    cache after every batch to keep pressure low.
+    """
     model, tokenizer = _load_model(model_path)
     device = next(model.parameters()).device
     results = []
 
-    for i in range(0, len(texts), SENTIMENT_BATCH_SIZE):
-        batch_texts = texts[i : i + SENTIMENT_BATCH_SIZE]
+    # Reduce batch size on MPS to avoid Metal OOM; CPU/CUDA use the configured value
+    effective_batch = 8 if device.type == "mps" else SENTIMENT_BATCH_SIZE
+
+    for i in range(0, len(texts), effective_batch):
+        batch_texts = texts[i : i + effective_batch]
         inputs = tokenizer(
             batch_texts,
             padding=True,
@@ -85,12 +125,18 @@ def predict_batch(texts: list[str], model_path: str | None = None) -> list[dict]
             outputs = model(**inputs)
             probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
 
+        # Free MPS command buffer memory immediately after each batch
+        if device.type == "mps":
+            torch.mps.empty_cache()
+
         for prob in probs:
             pred_idx = int(np.argmax(prob))
             label = LABEL_MAP[pred_idx]
-            score = float(prob[0]) * SCORE_MAP["positive"] + \
-                    float(prob[1]) * SCORE_MAP["neutral"] + \
-                    float(prob[2]) * SCORE_MAP["negative"]
+            score = (
+                float(prob[0]) * SCORE_MAP["positive"]
+                + float(prob[1]) * SCORE_MAP["neutral"]
+                + float(prob[2]) * SCORE_MAP["negative"]
+            )
             results.append({"label": label, "score": round(score, 4)})
 
     return results
@@ -182,11 +228,11 @@ def aggregate_daily_sentiment() -> int:
     sql = sql_text("""
         SELECT
             ss.ticker,
-            DATE(na.published_at) AS date,
-            AVG(ss.score)  AS avg_score,
-            MIN(ss.score)  AS min_score,
-            MAX(ss.score)  AS max_score,
-            COUNT(*)       AS article_count,
+            DATE(na.published_at)  AS date,
+            AVG(ss.score)          AS avg_score,
+            MIN(ss.score)          AS min_score,
+            MAX(ss.score)          AS max_score,
+            COUNT(*)               AS article_count,
             ROUND(100.0 * SUM(CASE WHEN ss.label = 'positive' THEN 1 ELSE 0 END) / COUNT(*), 2) AS positive_pct,
             ROUND(100.0 * SUM(CASE WHEN ss.label = 'negative' THEN 1 ELSE 0 END) / COUNT(*), 2) AS negative_pct,
             ROUND(100.0 * SUM(CASE WHEN ss.label = 'neutral'  THEN 1 ELSE 0 END) / COUNT(*), 2) AS neutral_pct
@@ -197,8 +243,12 @@ def aggregate_daily_sentiment() -> int:
     """)
 
     with get_conn() as conn:
-        import pandas as pd
-        df = pd.read_sql(sql, conn)
+        result = conn.execute(sql)
+        cols = list(result.keys())
+        rows = result.fetchall()
+
+    import pandas as pd
+    df = pd.DataFrame(rows, columns=cols)
 
     if df.empty:
         logger.info("No sentiment data to aggregate")
